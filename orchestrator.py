@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,37 @@ ES9Engine = _import_engine("es9-mcp", "es9_engine", "ES9Engine")
 DistingNTEngine = _import_engine("disting-nt-mcp", "disting_nt_engine", "DistingNTEngine")
 
 
+def _import_cv_sources() -> dict[str, type]:
+    """Import CV source classes from es9-mcp/cv_engine.py using the same isolation pattern."""
+    project_path = str(_BASE / "es9-mcp")
+    saved: dict[str, object] = {}
+    for name in _SHARED_NAMES:
+        if name in sys.modules:
+            saved[name] = sys.modules.pop(name)
+    sys.path.insert(0, project_path)
+    try:
+        mod = importlib.import_module("cv_engine")
+        classes = {
+            n: getattr(mod, n)
+            for n in ("StaticCV", "GateCV", "LfoCv", "EnvelopeCV")
+        }
+    finally:
+        if project_path in sys.path:
+            sys.path.remove(project_path)
+        for name in _SHARED_NAMES:
+            sys.modules.pop(name, None)
+        for name, mod_obj in saved.items():
+            sys.modules[name] = mod_obj
+    return classes
+
+
+_CV_SOURCES = _import_cv_sources()
+StaticCV = _CV_SOURCES["StaticCV"]
+GateCV = _CV_SOURCES["GateCV"]
+LfoCv = _CV_SOURCES["LfoCv"]
+EnvelopeCV = _CV_SOURCES["EnvelopeCV"]
+
+
 class Orchestrator:
     """Cross-module orchestrator for Expert Sleepers Eurorack system."""
 
@@ -65,6 +97,7 @@ class Orchestrator:
         self.fh2 = FH2Engine()
         self.es9 = ES9Engine()
         self.nt = DistingNTEngine(sysex_id=config.nt_sysex_id)
+        self._macro_mappings: dict[int, list[dict]] = {}
 
     # -- Connection Management --
 
@@ -76,11 +109,18 @@ class Orchestrator:
         )
 
     def connect_es9(self) -> str:
-        """Connect to ES-9 (MIDI only)."""
-        return self.es9.connect_midi(
+        """Connect to ES-9 (MIDI + optional audio for CV generation)."""
+        result = self.es9.connect_midi(
             output_port=self.config.es9_output_port or "ES-9",
             input_port=self.config.es9_input_port or self.config.es9_output_port or "ES-9",
         )
+        if self.config.es9_audio_device:
+            audio_result = self.es9.connect_audio(
+                device=self.config.es9_audio_device,
+                sample_rate=self.config.es9_sample_rate,
+            )
+            result += f" | audio: {audio_result}"
+        return result
 
     def connect_nt(self) -> str:
         """Connect to Disting NT."""
@@ -155,6 +195,9 @@ class Orchestrator:
         es9_info: dict[str, Any] = {"connected": self.es9.midi_connected}
         if self.es9.midi_connected:
             es9_info["ports"] = self.es9.port_info
+        es9_info["audio_running"] = self.es9.audio_running
+        if self.es9.audio_running and self.es9.cv_engine is not None:
+            es9_info["cv_sources"] = self.es9.cv_engine.get_source_info()
         status["es9"] = es9_info
 
         # Disting NT
@@ -229,6 +272,65 @@ class Orchestrator:
             results.append(result)
         return results
 
+    # -- Multi-param Macros --
+
+    def map_macro_to_nt_params(
+        self,
+        midi_cc: int,
+        targets: list[dict],
+        midi_channel: int = 0,
+    ) -> dict[str, Any]:
+        """Map a single MIDI CC to multiple Disting NT parameters with per-target scaling.
+
+        Each target dict: {"algo": int, "param": int, "min": int, "max": int}
+        """
+        mapped = []
+        for t in targets:
+            self.nt.set_midi_mapping(
+                t["algo"], t["param"], 5, midi_cc, midi_channel,
+                enabled=True, midi_min=t.get("min", 0), midi_max=t.get("max", 127),
+            )
+            mapped.append({"algo": t["algo"], "param": t["param"],
+                           "min": t.get("min", 0), "max": t.get("max", 127)})
+        self._macro_mappings[midi_cc] = mapped
+        return {"midi_cc": midi_cc, "targets": mapped, "midi_channel": midi_channel}
+
+    def batch_set_nt_parameters(self, params: list[dict]) -> list[dict[str, Any]]:
+        """Set multiple Disting NT parameters in one call.
+
+        Each dict: {"algo": int, "param": int, "value": int}
+        """
+        results = []
+        for p in params:
+            try:
+                self.nt.set_parameter_value(p["algo"], p["param"], p["value"])
+                results.append({"algo": p["algo"], "param": p["param"],
+                                "value": p["value"], "status": "ok"})
+            except Exception as e:
+                results.append({"algo": p["algo"], "param": p["param"],
+                                "error": str(e)})
+        return results
+
+    def sweep_nt_param(
+        self,
+        algo: int,
+        param: int,
+        start: int,
+        end: int,
+        steps: int = 64,
+        delay_ms: float = 20.0,
+    ) -> dict[str, Any]:
+        """Ramp a Disting NT parameter from start to end over time (blocking)."""
+        step_size = (end - start) / max(steps, 1)
+        delay_s = delay_ms / 1000.0
+        for i in range(steps + 1):
+            value = int(start + step_size * i)
+            self.nt.set_parameter_value(algo, param, value)
+            if i < steps:
+                time.sleep(delay_s)
+        return {"algo": algo, "param": param, "start": start, "end": end,
+                "steps": steps, "delay_ms": delay_ms}
+
     # -- Safety --
 
     def panic(self) -> dict[str, str]:
@@ -250,7 +352,12 @@ class Orchestrator:
                 for ch in range(16):
                     self.es9._send([0xB0 | ch, 123, 0])
                     self.es9._send([0xB0 | ch, 121, 0])
-                results["es9"] = "all notes off + reset controllers"
+                msg = "all notes off + reset controllers"
+                if self.es9.audio_running and self.es9.cv_engine is not None:
+                    for ch_num in list(self.es9.cv_engine._sources):
+                        self.es9.cv_engine.clear_source(ch_num)
+                    msg += " + CV sources cleared"
+                results["es9"] = msg
             except Exception as e:
                 results["es9"] = f"FAILED: {e}"
         else:

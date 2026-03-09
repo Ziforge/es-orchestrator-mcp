@@ -77,6 +77,26 @@ def _require_nt(ctx: Context) -> Orchestrator:
     return orch
 
 
+async def _ensure_es9_audio(ctx: Context) -> Orchestrator:
+    """Require ES-9 MIDI and auto-start audio stream if not running."""
+    orch = _require_es9(ctx)
+    if not orch.es9.audio_running:
+        config = _config(ctx)
+        device = config.es9_audio_device
+        if not device:
+            raise ValueError(
+                "ES9_AUDIO_DEVICE not configured. Set it in .env for CV generation."
+            )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: orch.es9.connect_audio(
+                device=device, sample_rate=config.es9_sample_rate
+            ),
+        )
+    return orch
+
+
 # ===================================================================
 # 1. SYSTEM TOOLS (4)
 # ===================================================================
@@ -100,6 +120,13 @@ async def system_status(ctx: Context) -> str:
                 lines.append(f"    Firmware: {info['firmware']}")
             if "preset" in info:
                 lines.append(f"    Preset: {info['preset']}")
+        if module == "es9":
+            audio = info.get("audio_running", False)
+            lines.append(f"    Audio: {'RUNNING' if audio else 'stopped'}")
+            cv_sources = info.get("cv_sources", {})
+            if cv_sources:
+                for ch, desc in cv_sources.items():
+                    lines.append(f"    CV ch{ch}: {desc}")
 
     return "\n".join(lines)
 
@@ -484,6 +511,394 @@ async def system_panic(ctx: Context) -> str:
         label = {"fh2": "FH-2", "es9": "ES-9", "nt": "Disting NT"}[module]
         lines.append(f"  {label}: {result}")
     return "\n".join(lines)
+
+
+# ===================================================================
+# 6. ES-9 MIXER & ROUTING TOOLS (6)
+# ===================================================================
+
+
+@mcp.tool()
+async def es9_set_mix_level(
+    ctx: Context, mix_bus: int, channel: int, db: float
+) -> str:
+    """Set a channel's level on an ES-9 virtual mix bus.
+
+    Args:
+        mix_bus: Mix bus number (1 or 2).
+        channel: Channel number within the mix bus (0-based).
+        db: Level in dB (e.g. 0.0 = unity, -inf = off).
+    """
+    orch = _require_es9(ctx)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.set_virtual_mix(mix_bus, channel, db)
+    )
+    return f"ES-9 mix{mix_bus} ch{channel} = {db} dB"
+
+
+@mcp.tool()
+async def es9_set_mix_pan(
+    ctx: Context, mix_bus: int, channel: int, pan: int
+) -> str:
+    """Set a channel's pan position on an ES-9 virtual mix bus.
+
+    Args:
+        mix_bus: Mix bus number (1 or 2).
+        channel: Channel number within the mix bus (0-based).
+        pan: Pan position (0=hard left, 64=centre, 127=hard right).
+    """
+    orch = _require_es9(ctx)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.set_virtual_pan(mix_bus, channel, pan)
+    )
+    return f"ES-9 mix{mix_bus} ch{channel} pan = {pan}"
+
+
+@mcp.tool()
+async def es9_set_input_routing(
+    ctx: Context, dsp: int, channels: list[int]
+) -> str:
+    """Set ES-9 capture (input) routing for a DSP block.
+
+    Args:
+        dsp: DSP block index (0-based).
+        channels: List of raw integer channel codes for the routing.
+    """
+    orch = _require_es9(ctx)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.set_capture_routing(dsp, channels)
+    )
+    return f"ES-9 DSP{dsp} input routing = {channels}"
+
+
+@mcp.tool()
+async def es9_set_output_routing(
+    ctx: Context, dsp: int, channels: list[int]
+) -> str:
+    """Set ES-9 output routing for a DSP block.
+
+    Args:
+        dsp: DSP block index (0-based).
+        channels: List of raw integer channel codes for the routing.
+    """
+    orch = _require_es9(ctx)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.set_output_routing(dsp, channels)
+    )
+    return f"ES-9 DSP{dsp} output routing = {channels}"
+
+
+@mcp.tool()
+async def es9_reset_mixer(ctx: Context) -> str:
+    """Reset the ES-9 mixer to default state (all levels unity, pans centre)."""
+    orch = _require_es9(ctx)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, orch.es9.reset_mixer)
+    return "ES-9 mixer reset to defaults"
+
+
+@mcp.tool()
+async def es9_set_options(
+    ctx: Context, mixer2_spdif: bool = False, midi_thru: bool = False
+) -> str:
+    """Set ES-9 global options.
+
+    Args:
+        mixer2_spdif: Route mixer 2 output to S/PDIF.
+        midi_thru: Enable MIDI thru.
+    """
+    orch = _require_es9(ctx)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.set_options(mixer2_spdif, midi_thru)
+    )
+    opts = []
+    if mixer2_spdif:
+        opts.append("mixer2→S/PDIF")
+    if midi_thru:
+        opts.append("MIDI thru")
+    return f"ES-9 options: {', '.join(opts) if opts else 'all off'}"
+
+
+# ===================================================================
+# 7. FH-2 LFO CONTROL TOOLS (3)
+# ===================================================================
+
+
+@mcp.tool()
+async def fh2_configure_lfo(
+    ctx: Context, lfo: int, params: dict, channel: int = 0
+) -> str:
+    """Configure multiple FH-2 LFO parameters at once.
+
+    Args:
+        lfo: LFO number (1-8).
+        params: Dict of param_name → value. Valid keys include:
+            "speed", "depth", "offset", "waveform", "oneshot", etc.
+        channel: MIDI channel (0 = use config default, 1-16 for specific).
+    """
+    orch = _require_fh2(ctx)
+    config = _config(ctx)
+    ch = channel if channel > 0 else config.fh2_midi_channel
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.fh2.configure_lfo(lfo, params, ch)
+    )
+    return f"FH-2 LFO{lfo}: configured {list(params.keys())} on ch{ch}"
+
+
+@mcp.tool()
+async def fh2_set_lfo_param(
+    ctx: Context, lfo: int, param: str, value: int, channel: int = 0
+) -> str:
+    """Set a single FH-2 LFO parameter.
+
+    Args:
+        lfo: LFO number (1-8).
+        param: Parameter name (e.g. "speed", "depth", "offset", "waveform").
+        value: Parameter value (0-127).
+        channel: MIDI channel (0 = use config default, 1-16 for specific).
+    """
+    orch = _require_fh2(ctx)
+    config = _config(ctx)
+    ch = channel if channel > 0 else config.fh2_midi_channel
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.fh2.set_lfo_param(lfo, param, value, ch)
+    )
+    return f"FH-2 LFO{lfo} {param} = {value} on ch{ch}"
+
+
+@mcp.tool()
+async def fh2_reset_lfo(ctx: Context, lfo: int, channel: int = 0) -> str:
+    """Reset an FH-2 LFO to its default state.
+
+    Args:
+        lfo: LFO number (1-8).
+        channel: MIDI channel (0 = use config default, 1-16 for specific).
+    """
+    orch = _require_fh2(ctx)
+    config = _config(ctx)
+    ch = channel if channel > 0 else config.fh2_midi_channel
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.fh2.reset_lfo(lfo, ch)
+    )
+    return f"FH-2 LFO{lfo} reset on ch{ch}"
+
+
+# ===================================================================
+# 8. ES-9 CV GENERATION TOOLS (4)
+# ===================================================================
+
+
+@mcp.tool()
+async def es9_set_cv_voltage(
+    ctx: Context, channel: int, voltage: float
+) -> str:
+    """Set a static CV voltage on an ES-9 audio output channel.
+
+    Auto-starts the ES-9 audio stream if not already running.
+
+    Args:
+        channel: Audio output channel (0-based).
+        voltage: Target voltage (e.g. -5.0 to +5.0).
+    """
+    from orchestrator import StaticCV
+
+    orch = await _ensure_es9_audio(ctx)
+    source = StaticCV(voltage)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.cv_engine.set_source(channel, source)
+    )
+    return f"ES-9 CV ch{channel} = {voltage}V (static)"
+
+
+@mcp.tool()
+async def es9_set_cv_gate(
+    ctx: Context, channel: int, high: bool = False, voltage: float = 5.0
+) -> str:
+    """Set a gate CV on an ES-9 audio output channel.
+
+    Auto-starts the ES-9 audio stream if not already running.
+
+    Args:
+        channel: Audio output channel (0-based).
+        high: Gate state (True = high/on, False = low/off).
+        voltage: Gate high voltage (default 5V).
+    """
+    from orchestrator import GateCV
+
+    orch = await _ensure_es9_audio(ctx)
+    source = GateCV(high=high, voltage=voltage)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.cv_engine.set_source(channel, source)
+    )
+    state = "HIGH" if high else "LOW"
+    return f"ES-9 CV ch{channel} = gate {state} ({voltage}V)"
+
+
+@mcp.tool()
+async def es9_generate_lfo(
+    ctx: Context,
+    channel: int,
+    shape: str = "sine",
+    rate_hz: float = 1.0,
+    depth_v: float = 5.0,
+    offset_v: float = 0.0,
+) -> str:
+    """Generate an LFO CV waveform on an ES-9 audio output channel.
+
+    Auto-starts the ES-9 audio stream if not already running.
+
+    Args:
+        channel: Audio output channel (0-based).
+        shape: Waveform shape: "sine", "triangle", "saw", "square", "random".
+        rate_hz: Frequency in Hz.
+        depth_v: Peak-to-peak amplitude in volts.
+        offset_v: DC offset in volts.
+    """
+    from orchestrator import LfoCv
+
+    orch = await _ensure_es9_audio(ctx)
+    source = LfoCv(shape=shape, rate_hz=rate_hz, depth_v=depth_v, offset_v=offset_v)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.cv_engine.set_source(channel, source)
+    )
+    return f"ES-9 CV ch{channel} = LFO {shape} {rate_hz}Hz ±{depth_v/2}V offset {offset_v}V"
+
+
+@mcp.tool()
+async def es9_trigger_envelope(
+    ctx: Context,
+    channel: int,
+    attack_ms: float = 10.0,
+    release_ms: float = 100.0,
+    peak_v: float = 5.0,
+) -> str:
+    """Trigger an attack-release envelope on an ES-9 audio output channel.
+
+    Auto-starts the ES-9 audio stream if not already running.
+
+    Args:
+        channel: Audio output channel (0-based).
+        attack_ms: Attack time in milliseconds.
+        release_ms: Release time in milliseconds.
+        peak_v: Peak voltage.
+    """
+    from orchestrator import EnvelopeCV
+
+    orch = await _ensure_es9_audio(ctx)
+    source = EnvelopeCV(attack_ms=attack_ms, release_ms=release_ms, peak_v=peak_v)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None, lambda: orch.es9.cv_engine.set_source(channel, source)
+    )
+    return f"ES-9 CV ch{channel} = envelope A={attack_ms}ms R={release_ms}ms peak={peak_v}V"
+
+
+# ===================================================================
+# 9. MULTI-PARAM MACRO TOOLS (3)
+# ===================================================================
+
+
+@mcp.tool()
+async def map_macro_to_nt_params(
+    ctx: Context,
+    midi_cc: int,
+    targets: list[dict],
+    midi_channel: int = 0,
+) -> str:
+    """Map a single MIDI CC to multiple Disting NT parameters (macro control).
+
+    Each target can have independent min/max scaling so one CC controls
+    several parameters simultaneously with different ranges.
+
+    Args:
+        midi_cc: MIDI CC number (0-127) to use as the macro source.
+        targets: List of target dicts, each with keys:
+            - algo: NT algorithm slot index (0-based)
+            - param: Parameter number (0-based)
+            - min: (optional) Minimum mapped value (default 0)
+            - max: (optional) Maximum mapped value (default 127)
+        midi_channel: MIDI channel (0=omni, 1-15 for specific).
+    """
+    orch = _require_nt(ctx)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, lambda: orch.map_macro_to_nt_params(midi_cc, targets, midi_channel)
+    )
+    lines = [f"Macro CC{midi_cc} → {len(result['targets'])} targets:"]
+    for t in result["targets"]:
+        lines.append(f"  slot {t['algo']} param {t['param']} (range {t['min']}–{t['max']})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def nt_batch_set_parameters(
+    ctx: Context, params: list[dict]
+) -> str:
+    """Set multiple Disting NT parameters in a single call.
+
+    Args:
+        params: List of parameter dicts, each with keys:
+            - algo: NT algorithm slot index (0-based)
+            - param: Parameter number (0-based)
+            - value: Parameter value (signed 16-bit)
+    """
+    orch = _require_nt(ctx)
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(
+        None, lambda: orch.batch_set_nt_parameters(params)
+    )
+    ok = sum(1 for r in results if "status" in r and r["status"] == "ok")
+    err = len(results) - ok
+    lines = [f"Batch set: {ok} ok, {err} errors"]
+    for r in results:
+        if "error" in r:
+            lines.append(f"  ERROR slot {r['algo']} param {r['param']}: {r['error']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def sweep_nt_param(
+    ctx: Context,
+    algo: int,
+    param: int,
+    start: int,
+    end: int,
+    steps: int = 64,
+    delay_ms: float = 20.0,
+) -> str:
+    """Sweep a Disting NT parameter from start to end over time.
+
+    Runs a blocking ramp in the executor thread. Total duration ≈ steps × delay_ms.
+
+    Args:
+        algo: NT algorithm slot index (0-based).
+        param: Parameter number (0-based).
+        start: Starting parameter value.
+        end: Ending parameter value.
+        steps: Number of intermediate steps (default 64).
+        delay_ms: Delay between steps in milliseconds (default 20).
+    """
+    orch = _require_nt(ctx)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, lambda: orch.sweep_nt_param(algo, param, start, end, steps, delay_ms)
+    )
+    total_ms = steps * delay_ms
+    return (
+        f"Swept NT slot {algo} param {param}: {start} → {end} "
+        f"({steps} steps, {total_ms:.0f}ms)"
+    )
 
 
 # ===================================================================

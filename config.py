@@ -20,6 +20,8 @@ class OrchestratorConfig:
     # ES-9
     es9_output_port: str = ""
     es9_input_port: str = ""
+    es9_audio_device: str = ""
+    es9_sample_rate: int = 48000
 
     # Disting NT
     nt_output_port: str = ""
@@ -39,6 +41,8 @@ class OrchestratorConfig:
             fh2_midi_channel=int(os.getenv("FH2_MIDI_CHANNEL", "1")),
             es9_output_port=os.getenv("ES9_OUTPUT_PORT", ""),
             es9_input_port=os.getenv("ES9_INPUT_PORT", ""),
+            es9_audio_device=os.getenv("ES9_AUDIO_DEVICE", ""),
+            es9_sample_rate=int(os.getenv("ES9_SAMPLE_RATE", "48000")),
             nt_output_port=os.getenv("DISTING_NT_OUTPUT_PORT", ""),
             nt_input_port=os.getenv("DISTING_NT_INPUT_PORT", ""),
             nt_sysex_id=int(os.getenv("DISTING_NT_SYSEX_ID", "0")),
