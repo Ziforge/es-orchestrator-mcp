@@ -29,6 +29,9 @@ class OrchestratorConfig:
     nt_sysex_id: int = 0
     nt_midi_channel: int = 1
 
+    # nt_helper proxy (optional — thorinside/nt_helper Flutter app)
+    nt_helper_url: str = ""
+
     # Global
     auto_connect: bool = False
 
@@ -47,6 +50,7 @@ class OrchestratorConfig:
             nt_input_port=os.getenv("DISTING_NT_INPUT_PORT", ""),
             nt_sysex_id=int(os.getenv("DISTING_NT_SYSEX_ID", "0")),
             nt_midi_channel=int(os.getenv("DISTING_NT_MIDI_CHANNEL", "1")),
+            nt_helper_url=os.getenv("NT_HELPER_URL", ""),
             auto_connect=os.getenv("AUTO_CONNECT", "false").lower()
             in ("true", "1", "yes"),
         )

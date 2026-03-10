@@ -10,6 +10,8 @@ from typing import AsyncIterator
 from mcp.server.fastmcp import Context, FastMCP
 
 from config import OrchestratorConfig
+from nt_metadata import NTMetadataStore
+from nt_helper_proxy import NTHelperProxy
 from orchestrator import Orchestrator
 
 # ---------------------------------------------------------------------------
@@ -28,9 +30,34 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
         for module, result in results.items():
             print(f"[es-orchestrator] {module}: {result}")
 
-    yield {"orchestrator": orch, "config": config}
+    # Load bundled algorithm metadata
+    metadata = NTMetadataStore()
+    try:
+        metadata.load()
+        print(f"[es-orchestrator] Algorithm metadata: {metadata.count} algorithms loaded")
+    except Exception as e:
+        print(f"[es-orchestrator] Algorithm metadata failed to load: {e}")
+
+    # Optional nt_helper proxy
+    nt_proxy: NTHelperProxy | None = None
+    if config.nt_helper_url:
+        nt_proxy = NTHelperProxy(config.nt_helper_url)
+        available = await nt_proxy.check_available()
+        if available:
+            print(f"[es-orchestrator] nt_helper proxy: connected ({config.nt_helper_url})")
+        else:
+            print(f"[es-orchestrator] nt_helper proxy: configured but not reachable ({config.nt_helper_url})")
+
+    yield {
+        "orchestrator": orch,
+        "config": config,
+        "metadata": metadata,
+        "nt_proxy": nt_proxy,
+    }
 
     # Cleanup
+    if nt_proxy:
+        await nt_proxy.close()
     orch.disconnect_all()
 
 
@@ -40,9 +67,11 @@ mcp = FastMCP(
         "Orchestrate Expert Sleepers Eurorack modules: FH-2 (MIDI-to-CV), "
         "ES-9 (USB audio interface), and Disting NT (multi-algorithm DSP). "
         "Provides cross-module MIDI CC mapping, proxied single-module operations, "
-        "and system-wide control. When the orchestrator is running, individual "
-        "per-module MCP servers should be stopped (macOS can't share MIDI output "
-        "ports between processes)."
+        "and system-wide control. Includes a bundled library of ~114 Disting NT "
+        "algorithm metadata (searchable offline — no device needed) and an optional "
+        "proxy to thorinside/nt_helper for live routing visualization and editing. "
+        "When the orchestrator is running, individual per-module MCP servers should "
+        "be stopped (macOS can't share MIDI output ports between processes)."
     ),
     lifespan=lifespan,
 )
@@ -75,6 +104,29 @@ def _require_nt(ctx: Context) -> Orchestrator:
     if not orch.nt.connected:
         raise ValueError("Disting NT not connected. Use connect_module('nt') first.")
     return orch
+
+
+def _metadata(ctx: Context) -> NTMetadataStore:
+    return ctx.request_context.lifespan_context["metadata"]
+
+
+def _nt_proxy(ctx: Context) -> NTHelperProxy | None:
+    return ctx.request_context.lifespan_context.get("nt_proxy")
+
+
+def _require_nt_proxy(ctx: Context) -> NTHelperProxy:
+    proxy = _nt_proxy(ctx)
+    if proxy is None:
+        raise ValueError(
+            "nt_helper proxy not configured. Set NT_HELPER_URL in .env "
+            "(e.g. http://localhost:3847/mcp) and restart."
+        )
+    if proxy.available is False:
+        raise ValueError(
+            "nt_helper proxy is configured but not reachable. "
+            "Ensure the nt_helper Flutter app is running."
+        )
+    return proxy
 
 
 async def _ensure_es9_audio(ctx: Context) -> Orchestrator:
@@ -127,6 +179,20 @@ async def system_status(ctx: Context) -> str:
             if cv_sources:
                 for ch, desc in cv_sources.items():
                     lines.append(f"    CV ch{ch}: {desc}")
+
+    # Algorithm metadata status
+    meta = _metadata(ctx)
+    lines.append(f"\n  [Algorithm Library] loaded ({meta.count} algorithms)" if meta.count > 0
+                 else "\n  [Algorithm Library] not loaded")
+
+    # nt_helper proxy status
+    proxy = _nt_proxy(ctx)
+    if proxy is None:
+        lines.append("  [nt_helper Proxy] not configured")
+    elif proxy.available:
+        lines.append("  [nt_helper Proxy] connected")
+    else:
+        lines.append("  [nt_helper Proxy] configured but not reachable")
 
     return "\n".join(lines)
 
@@ -899,6 +965,221 @@ async def sweep_nt_param(
         f"Swept NT slot {algo} param {param}: {start} → {end} "
         f"({steps} steps, {total_ms:.0f}ms)"
     )
+
+
+# ===================================================================
+# 10. NT ALGORITHM METADATA TOOLS (2) — always available, no device needed
+# ===================================================================
+
+
+@mcp.tool()
+async def nt_search_algorithms(
+    ctx: Context, query: str, max_results: int = 10
+) -> str:
+    """Fuzzy search over the bundled Disting NT algorithm library.
+
+    Works offline — no device connection needed. Returns ranked results
+    with GUID, name, categories, and specs.
+
+    Args:
+        query: Search term (algorithm name, category, feature, etc.).
+        max_results: Maximum number of results to return (default 10).
+    """
+    meta = _metadata(ctx)
+    results = meta.search(query, max_results=max_results)
+
+    if not results:
+        return f"No algorithms found matching '{query}'."
+
+    lines = [f"=== Algorithm Search: '{query}' ({len(results)} results) ==="]
+    for r in results:
+        cats = ", ".join(r["categories"][:3]) if r["categories"] else "—"
+        lines.append(
+            f"\n  [{r['guid']}] {r['name']} (score: {r['score']})"
+            f"\n    Categories: {cats}"
+            f"\n    {r['short_description']}"
+            f"\n    Params: {r['num_parameters']}  In: {r['num_inputs']}  Out: {r['num_outputs']}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def nt_algorithm_info(ctx: Context, identifier: str) -> str:
+    """Get full details for a Disting NT algorithm by GUID or exact name.
+
+    Works offline — no device connection needed. Shows description,
+    all parameters with types/ranges, and input/output ports.
+    Falls back to fuzzy suggestions if the identifier is not an exact match.
+
+    Args:
+        identifier: Algorithm GUID (e.g. "clck") or exact name (e.g. "Clock").
+    """
+    meta = _metadata(ctx)
+    algo = meta.get(identifier)
+
+    if algo is None:
+        # Offer fuzzy suggestions
+        suggestions = meta.search(identifier, max_results=5)
+        if suggestions:
+            names = ", ".join(f"{s['name']} ({s['guid']})" for s in suggestions)
+            return f"Algorithm '{identifier}' not found. Did you mean: {names}?"
+        return f"Algorithm '{identifier}' not found."
+
+    lines = [f"=== {algo['name']} [{algo['guid']}] ==="]
+    lines.append(f"  {algo.get('description', 'No description.')}")
+
+    cats = algo.get("categories", [])
+    if cats:
+        lines.append(f"\n  Categories: {', '.join(cats)}")
+
+    use_cases = algo.get("use_cases", [])
+    if use_cases:
+        lines.append(f"  Use cases: {', '.join(use_cases)}")
+
+    # Parameters
+    params = algo.get("parameters", [])
+    if params:
+        lines.append(f"\n  === Parameters ({len(params)}) ===")
+        for i, p in enumerate(params):
+            ptype = p.get("type", "")
+            pmin = p.get("min", "")
+            pmax = p.get("max", "")
+            pdefault = p.get("default", "")
+            desc = p.get("description", "")
+            line = f"    [{i}] {p['name']}"
+            if ptype:
+                line += f" ({ptype})"
+            if pmin != "" or pmax != "":
+                line += f" [{pmin}..{pmax}]"
+            if pdefault != "":
+                line += f" default={pdefault}"
+            lines.append(line)
+            if desc:
+                lines.append(f"        {desc}")
+
+    # Input ports
+    inputs = algo.get("input_ports", [])
+    if inputs:
+        lines.append(f"\n  === Inputs ({len(inputs)}) ===")
+        for port in inputs:
+            desc = f" — {port['description']}" if port.get("description") else ""
+            lines.append(f"    {port['name']}{desc}")
+
+    # Output ports
+    outputs = algo.get("output_ports", [])
+    if outputs:
+        lines.append(f"\n  === Outputs ({len(outputs)}) ===")
+        for port in outputs:
+            desc = f" — {port['description']}" if port.get("description") else ""
+            lines.append(f"    {port['name']}{desc}")
+
+    return "\n".join(lines)
+
+
+# ===================================================================
+# 11. NT_HELPER PROXY TOOLS (5) — optional, requires nt_helper app
+# ===================================================================
+
+
+@mcp.tool()
+async def nt_helper_show_routing(ctx: Context) -> str:
+    """Show the current Disting NT routing as a visual diagram.
+
+    Requires the nt_helper Flutter app running with its MCP server enabled.
+    """
+    proxy = _require_nt_proxy(ctx)
+    result = await proxy.show_routing()
+    if result is None:
+        return "Error: nt_helper did not return routing data."
+    return result if isinstance(result, str) else json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def nt_helper_show_screen(ctx: Context, display_mode: str = "") -> str:
+    """Show the current Disting NT screen content via nt_helper.
+
+    Requires the nt_helper Flutter app running with its MCP server enabled.
+
+    Args:
+        display_mode: Optional display mode hint (empty for default).
+    """
+    proxy = _require_nt_proxy(ctx)
+    result = await proxy.show_screen(display_mode)
+    if result is None:
+        return "Error: nt_helper did not return screen data."
+    return result if isinstance(result, str) else json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def nt_helper_edit_slot(ctx: Context, slot_index: int, data: dict) -> str:
+    """Edit parameters on a specific Disting NT algorithm slot via nt_helper.
+
+    Requires the nt_helper Flutter app running with its MCP server enabled.
+
+    Args:
+        slot_index: Algorithm slot index (0-based).
+        data: Dict of parameter edits to apply (key-value pairs).
+    """
+    proxy = _require_nt_proxy(ctx)
+    result = await proxy.edit_slot(slot_index, data)
+    if result is None:
+        return "Error: nt_helper did not return edit result."
+    return result if isinstance(result, str) else json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def nt_helper_add_algorithm(
+    ctx: Context,
+    name: str = "",
+    guid: str = "",
+    slot_index: int = -1,
+) -> str:
+    """Add an algorithm to the Disting NT preset by name or GUID via nt_helper.
+
+    At least one of name or guid must be provided. Provide slot_index to insert
+    at a specific position (default: append).
+
+    Requires the nt_helper Flutter app running with its MCP server enabled.
+
+    Args:
+        name: Algorithm name (fuzzy matched by nt_helper).
+        guid: Algorithm GUID (exact match, e.g. "clck").
+        slot_index: Target slot index (-1 = append).
+    """
+    if not name and not guid:
+        return "Error: provide at least one of 'name' or 'guid'."
+    proxy = _require_nt_proxy(ctx)
+    result = await proxy.add_algorithm(name=name, guid=guid, slot_index=slot_index)
+    if result is None:
+        return "Error: nt_helper did not return add result."
+    return result if isinstance(result, str) else json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def nt_helper_search_parameters(
+    ctx: Context,
+    query: str,
+    scope: str = "preset",
+    slot_index: int = -1,
+    partial_match: bool = False,
+) -> str:
+    """Search parameters across the current Disting NT preset via nt_helper.
+
+    Requires the nt_helper Flutter app running with its MCP server enabled.
+
+    Args:
+        query: Parameter name or value to search for.
+        scope: Search scope: "preset" (all slots) or "slot" (single slot).
+        slot_index: Slot index when scope="slot" (-1 = ignored).
+        partial_match: Allow partial name matches.
+    """
+    proxy = _require_nt_proxy(ctx)
+    result = await proxy.search_parameters(
+        query=query, scope=scope, slot_index=slot_index, partial_match=partial_match
+    )
+    if result is None:
+        return "Error: nt_helper did not return search results."
+    return result if isinstance(result, str) else json.dumps(result, indent=2)
 
 
 # ===================================================================
